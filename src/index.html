@@ -2,6 +2,18 @@
 <html lang="en">
 <head>
 	<title>AudioMass - Audio Editor</title>
+	<script>
+	// GitHub Pages subpath fix: rewrite absolute popup paths (/eq.html, /sp.html, ...) to relative
+	(function () {
+		var _open = window.open;
+		window.open = function (url, name, specs) {
+			if (typeof url === 'string' && /^\/(eq|sp|mix|about|index-cache|index-final)\.html/.test(url)) {
+				url = url.substring(1);
+			}
+			return _open.call(window, url, name, specs);
+		};
+	})();
+	</script>
 	<link href="ico.png" rel="shortcut icon">
 	<meta charset="utf-8" />
 	<link rel="manifest" href="manifest.json">
