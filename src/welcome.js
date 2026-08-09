@@ -23,7 +23,6 @@ setTimeout(function () {
 
 	PKAudioEditor._deps.Wlc = function () {
 			var body_str = '';
-			var body_str2 = '';
 			var mobile_note = '';
 
 			if (PKAE.isMobile) {
@@ -34,7 +33,6 @@ setTimeout(function () {
 			}
 			else {
 				body_str = 'Tips:<br/>Please keep in mind that most key shortcuts rely on the <strong>Shift + <u>key</u></strong> combo. (eg Shift+Z for undo, Shift+C copy, Shift+X cut... etc )<br/><br/>';
-				body_str2 = 'Check out the codebase on <a href="https://github.com/pkalogiros/audiomass" target="_blank">Github</a><br/><br/>'; // checkout the code on github
 			}
 
 			// Welcome to AudioMass,
@@ -52,7 +50,6 @@ setTimeout(function () {
 				body_str+
 				'You can load any type of audio your browser supports and perform operations such as fade in, cut, trim, change the volume, '+
 				'and apply a plethora of audio effects.<br/><br/>'+
-				body_str2+
 				'I hope you enjoy the little music pieces. I wrote them a long time ago :)'+
 				'</div>',
 			setup:function( q ) {
