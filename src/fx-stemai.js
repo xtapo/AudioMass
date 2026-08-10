@@ -8,7 +8,8 @@
  * or exports them as WAV files (multi stem).
  *
  * Model: StemSplitio/htdemucs-onnx (MIT) — single-file 4-stem HT-Demucs.
- * Runtime stack mirrors the proven demucs-onnx browser demo (ort 1.18 ESM).
+ * Runtime is loaded as a classic <script> (dynamic import gets blocked by
+ * some browsers' tracking prevention).
  */
 (function ( w, d, PKAE ) {
 	'use strict';
@@ -16,7 +17,15 @@
 	var app = PKAE;
 
 	var MODEL_URL = 'https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs_fp16weights.onnx';
-	var ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.mjs';
+	var ORT_VER = '1.18.0';
+	var ORT_URLS = [
+		'https://cdn.jsdelivr.net/npm/onnxruntime-web@' + ORT_VER + '/dist/ort.min.js',
+		'https://unpkg.com/onnxruntime-web@' + ORT_VER + '/dist/ort.min.js'
+	];
+	var ORT_WASM_PATHS = [
+		'https://cdn.jsdelivr.net/npm/onnxruntime-web@' + ORT_VER + '/dist/',
+		'https://unpkg.com/onnxruntime-web@' + ORT_VER + '/dist/'
+	];
 
 	var SAMPLE_RATE = 44100;
 	var N_SAMPLES = 343980;              // 7.8s @ 44.1kHz — hard-bound to the ONNX graph
@@ -44,22 +53,36 @@
 
 	// ---------- runtime / model loading ----------
 
-	function loadOrt () {
+	function loadOrt ( cdnIndex ) {
 		if (ort) return Promise.resolve(ort);
 		if (ort_loading) {
-			return new Promise(function (ok) {
+			return new Promise(function (ok, no) {
 				var t = setInterval(function () {
 					if (ort) { clearInterval(t); ok(ort); }
 				}, 200);
 			});
 		}
 		ort_loading = true;
-		return import(/* webpackIgnore: true */ ORT_URL).then(function (m) {
-			ort = m;
-			// single-threaded: GitHub Pages cannot send the COOP/COEP headers
-			// required for SharedArrayBuffer-based threading
-			ort.env.wasm.numThreads = 1;
-			return ort;
+		var i = cdnIndex || 0;
+		return new Promise(function (ok, no) {
+			var tryNext = function () {
+				if (i >= ORT_URLS.length)
+					return no(new Error('Could not load onnxruntime-web from CDN — check network or disable strict Tracking Prevention for this site'));
+				var s = d.createElement('script');
+				s.src = ORT_URLS[i];
+				s.onload = function () {
+					if (!w.ort) { ++i; return tryNext(); }
+					ort = w.ort;
+					// single-threaded: GitHub Pages cannot send the COOP/COEP
+					// headers required for SharedArrayBuffer-based threading
+					ort.env.wasm.numThreads = 1;
+					ort.env.wasm.wasmPaths = ORT_WASM_PATHS[i];
+					ok(ort);
+				};
+				s.onerror = function () { ++i; tryNext(); };
+				d.head.appendChild(s);
+			};
+			tryNext();
 		});
 	}
 
@@ -125,9 +148,9 @@
 			});
 		}).then(function () {
 			onProgress && onProgress('init');
-			// WASM first (matches the proven demo stack). If the tab cannot
-			// allocate the WASM heap (Aborted), retry once on WebGPU, which
-			// keeps weights in GPU memory instead.
+			// WASM first (proven demo stack). If the tab cannot allocate the
+			// WASM heap (Aborted), retry once on WebGPU, which keeps weights
+			// in GPU memory instead.
 			return createSession(['wasm']).catch(function (e) {
 				console.warn('WASM session failed, falling back to WebGPU', e);
 				if (!(w.navigator && w.navigator.gpu)) throw e;
