@@ -1,12 +1,14 @@
 /*
  * AudioMass — AI Stem Separation (HT-Demucs ONNX, in-browser)
- * Self-contained feature module: downloads the model once from Hugging Face,
- * caches it via the Cache API, runs chunked overlap-add inference with
- * onnxruntime-web (WebGPU when available, WASM fallback), and writes the
- * chosen stem(s) back to the editor (single stem, with undo) or exports
- * them as WAV files (multi stem).
+ * Self-contained feature module: downloads the model once from Hugging Face
+ * (cached via the Cache API), creates the ONNX session from a Blob URL so
+ * the 166 MB weights never sit in the JS heap, and runs chunked overlap-add
+ * inference with onnxruntime-web (WASM first, WebGPU as fallback).
+ * Writes the chosen stem(s) back to the editor (single stem, with undo)
+ * or exports them as WAV files (multi stem).
  *
  * Model: StemSplitio/htdemucs-onnx (MIT) — single-file 4-stem HT-Demucs.
+ * Runtime stack mirrors the proven demucs-onnx browser demo (ort 1.18 ESM).
  */
 (function ( w, d, PKAE ) {
 	'use strict';
@@ -14,9 +16,7 @@
 	var app = PKAE;
 
 	var MODEL_URL = 'https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs_fp16weights.onnx';
-	var ORT_VER = '1.22.0';
-	var ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@' + ORT_VER + '/dist/ort.min.js';
-	var ORT_WASM_PATH = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@' + ORT_VER + '/dist/';
+	var ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.mjs';
 
 	var SAMPLE_RATE = 44100;
 	var N_SAMPLES = 343980;              // 7.8s @ 44.1kHz — hard-bound to the ONNX graph
@@ -32,10 +32,11 @@
 	];
 	var STEM_ROW = { drums: 0, bass: 1, other: 2, vocals: 3 };
 
-	var ort_ready = false;
+	var ort = null;
 	var ort_loading = false;
 	var session = null;
 	var session_ep = null;
+	var model_blob_url = null;
 	var cancelled = false;
 
 	function engine () { return app.engine; }
@@ -44,31 +45,33 @@
 	// ---------- runtime / model loading ----------
 
 	function loadOrt () {
-		if (ort_ready) return Promise.resolve();
+		if (ort) return Promise.resolve(ort);
 		if (ort_loading) {
-			return new Promise(function (ok, no) {
+			return new Promise(function (ok) {
 				var t = setInterval(function () {
-					if (ort_ready) { clearInterval(t); ok(); }
+					if (ort) { clearInterval(t); ok(ort); }
 				}, 200);
 			});
 		}
 		ort_loading = true;
-		return new Promise(function (ok, no) {
-			var s = d.createElement('script');
-			s.src = ORT_URL;
-			s.onload = function () { ort_ready = true; ok(); };
-			s.onerror = function () { no(new Error('Could not load onnxruntime-web from CDN')); };
-			d.head.appendChild(s);
+		return import(/* webpackIgnore: true */ ORT_URL).then(function (m) {
+			ort = m;
+			// single-threaded: GitHub Pages cannot send the COOP/COEP headers
+			// required for SharedArrayBuffer-based threading
+			ort.env.wasm.numThreads = 1;
+			return ort;
 		});
 	}
 
-	// Downloads the model with progress into the Cache API (and the browser's
-	// HTTP cache). The bytes are NOT kept in JS memory — the session is later
-	// created straight from the URL so we never hold a 166 MB ArrayBuffer.
-	function ensureModelCached ( onProgress ) {
+	// Downloads the model once (with progress) into the Cache API, then hands
+	// it to onnxruntime as a Blob URL — the browser owns the bytes, so the
+	// 166 MB never occupy the JS heap.
+	function getModelBlobUrl ( onProgress ) {
+		if (model_blob_url) return Promise.resolve(model_blob_url);
+
 		return w.caches.open('audiomass-stemai-v1').then(function (cache) {
 			return cache.match(MODEL_URL).then(function (hit) {
-				if (hit) return ;
+				if (hit) return hit.blob();
 
 				return w.fetch(MODEL_URL).then(function (res) {
 					if (!res.ok) throw new Error('Model download failed (HTTP ' + res.status + ')');
@@ -80,17 +83,11 @@
 					function pump () {
 						return reader.read().then(function (r) {
 							if (r.done) {
-								var buf = new ArrayBuffer(received);
-								var view = new Uint8Array(buf);
-								var off = 0;
-								for (var i = 0; i < parts.length; ++i) {
-									view.set(parts[i], off);
-									off += parts[i].length;
-								}
+								var blob = new Blob(parts);
 								parts = null;
-								// best-effort cache; may fail on quota
-								try { cache.put(MODEL_URL, new Response(buf)); } catch (e) {}
-								return ;
+								// best-effort persistent cache; may fail on quota
+								try { cache.put(MODEL_URL, new Response(blob)); } catch (e) {}
+								return blob;
 							}
 							parts.push(r.value);
 							received += r.value.length;
@@ -101,15 +98,16 @@
 					return pump();
 				});
 			});
+		}).then(function (blob) {
+			model_blob_url = w.URL.createObjectURL(blob);
+			return model_blob_url;
 		});
 	}
 
 	function createSession ( providers ) {
-		return w.ort.InferenceSession.create(MODEL_URL, {
+		return ort.InferenceSession.create(model_blob_url, {
 			executionProviders: providers,
-			graphOptimizationLevel: 'all',
-			enableMemPattern: false,
-			enableCpuMemArena: false
+			graphOptimizationLevel: 'all'
 		}).then(function (sess) {
 			session = sess;
 			session_ep = providers[0];
@@ -122,24 +120,19 @@
 
 		return loadOrt().then(function () {
 			onProgress && onProgress('download');
-			return ensureModelCached(function (frac, received) {
+			return getModelBlobUrl(function (frac, received) {
 				onProgress && onProgress('download', frac, received);
 			});
 		}).then(function () {
 			onProgress && onProgress('init');
-			var ort = w.ort;
-			ort.env.wasm.wasmPaths = ORT_WASM_PATH;
-			ort.env.wasm.numThreads = 1;
-			if (ort.env.webgpu) ort.env.webgpu.powerPreference = 'high-performance';
-
-			// WebGPU keeps weights on the GPU — avoids the WASM heap entirely
-			if (w.navigator && w.navigator.gpu) {
-				return createSession(['webgpu']).catch(function (e) {
-					console.warn('WebGPU session failed, falling back to WASM', e);
-					return createSession(['wasm']);
-				});
-			}
-			return createSession(['wasm']);
+			// WASM first (matches the proven demo stack). If the tab cannot
+			// allocate the WASM heap (Aborted), retry once on WebGPU, which
+			// keeps weights in GPU memory instead.
+			return createSession(['wasm']).catch(function (e) {
+				console.warn('WASM session failed, falling back to WebGPU', e);
+				if (!(w.navigator && w.navigator.gpu)) throw e;
+				return createSession(['webgpu']);
+			});
 		});
 	}
 
@@ -207,7 +200,6 @@
 	// Separates the given model rows in ONE pass — the model predicts all 4
 	// stems per run, so multi-stem extraction costs no extra inference time.
 	function separateRows ( mix, rows, onProgress ) {
-		var ort = w.ort;
 		var totalLen = mix[0].length;
 		var nChunks = Math.max(1, Math.ceil(totalLen / STRIDE));
 		var outs = {};
@@ -260,16 +252,18 @@
 		return step();
 	}
 
-	// If inference dies on WebGPU (unsupported op, driver issue...), rebuild
-	// the session on WASM and retry once.
+	// If inference dies on the chosen EP (unsupported op, driver issue...),
+	// rebuild the session on the other EP and retry once.
 	function separateWithRetry ( mix, rows, onProgress ) {
 		return separateRows(mix, rows, onProgress).catch(function (e) {
-			if (session_ep !== 'webgpu' || (e && e.message === 'Cancelled')) throw e;
-			console.warn('WebGPU inference failed, retrying on WASM', e);
+			if (e && e.message === 'Cancelled') throw e;
+			var other = session_ep === 'wasm' ? 'webgpu' : 'wasm';
+			if (other === 'webgpu' && !(w.navigator && w.navigator.gpu)) throw e;
+			console.warn('Inference failed on ' + session_ep + ', retrying on ' + other, e);
 			try { session && session.release && session.release(); } catch (_) {}
 			session = null;
 			session_ep = null;
-			return createSession(['wasm']).then(function () {
+			return createSession([other]).then(function () {
 				return separateRows(mix, rows, onProgress);
 			});
 		});
@@ -286,7 +280,7 @@
 	function friendlyError ( err ) {
 		var msg = err && err.message ? err.message : (err + '');
 		if (/aborted|out of memory|memory/i.test(msg))
-			msg += ' — likely out of memory: close other tabs/apps, or select a shorter region and retry.';
+			msg += ' — the model needs ~1.5 GB free RAM. Close other tabs/apps and retry. If it persists, your device may not have enough free memory for in-browser AI.';
 		return msg;
 	}
 
@@ -309,7 +303,7 @@
 			else if (phase === 'download')
 				ui.progress(0, 'Downloading AI model (166 MB, first run only)...');
 			else if (phase === 'init')
-				ui.progress(1, 'Initializing model' + (w.navigator && w.navigator.gpu ? ' on GPU' : '') + '...');
+				ui.progress(1, 'Initializing model (needs ~1.5 GB free RAM)...');
 		}).then(function () {
 			if (cancelled) throw new Error('Cancelled');
 			ui.progress(0, 'Preparing audio...');
@@ -325,7 +319,7 @@
 			for (var k in rowMap) rows.push(STEM_ROW[k]);
 
 			return separateWithRetry(mix, rows, function (frac, i2, n) {
-				ui.progress(frac, 'Running AI model: chunk ' + i2 + '/' + n + '...');
+				ui.progress(frac, 'Running AI model (' + session_ep + '): chunk ' + i2 + '/' + n + '...');
 			}).then(function (rowOuts) {
 				var stems = {};
 				for (var j = 0; j < stemIds.length; ++j) {
@@ -428,10 +422,7 @@
 			'First run downloads ~166 MB model (cached afterwards).<br>' +
 			'One inference pass produces all stems — ticking more stems costs no extra time.<br>' +
 			'A single stem loads into the editor (undo-able); multiple stems are exported as WAV downloads.<br>' +
-			(w.navigator && w.navigator.gpu ?
-				'Your browser supports WebGPU — inference will run on the GPU.<br>' :
-				'Your browser has no WebGPU — inference runs on CPU (WASM), slower.<br>') +
-			'If it aborts, close other tabs or select a shorter region.</div>' +
+			'Needs ~1.5 GB free RAM. If it aborts, close other tabs/apps and retry.</div>' +
 			'<div class="pk_row" style="border:none">' +
 			'<div class="pk_stemai_track" style="height:6px;background:#222;border-radius:3px;overflow:hidden">' +
 			'<div class="pk_stemai_fill" style="height:100%;width:0%;background:#4a9d5b;transition:width .2s"></div></div>' +
