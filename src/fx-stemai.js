@@ -119,14 +119,20 @@
 			onProgress && onProgress('init');
 			var ort = w.ort;
 			ort.env.wasm.wasmPaths = ORT_WASM_PATH;
-			ort.env.wasm.numThreads = w.crossOriginIsolated ?
-				Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+			// single-threaded: GitHub Pages cannot send the COOP/COEP headers
+			// required for SharedArrayBuffer-based threading
+			ort.env.wasm.numThreads = 1;
 			return ort.InferenceSession.create(new Uint8Array(bytes), {
 				executionProviders: ['wasm'],
-				graphOptimizationLevel: 'all'
+				graphOptimizationLevel: 'all',
+				// avoid big up-front arena/pattern allocations — they can
+				// push the WASM heap over the tab memory limit (Aborted())
+				enableMemPattern: false,
+				enableCpuMemArena: false
 			});
 		}).then(function (sess) {
 			session = sess;
+			model_bytes = null; // free our raw copy; the session owns the weights now
 			return sess;
 		});
 	}
@@ -256,6 +262,13 @@
 		return out;
 	}
 
+	function friendlyError ( err ) {
+		var msg = err && err.message ? err.message : (err + '');
+		if (/aborted|out of memory|memory/i.test(msg))
+			msg += ' — likely out of memory: close other tabs/apps, or select a shorter region and retry.';
+		return msg;
+	}
+
 	// ---------- main flow ----------
 
 	function runSeparation ( stemIds, ui ) {
@@ -356,7 +369,7 @@
 		}).catch(function (err) {
 			if (err && err.message === 'Cancelled') return ;
 			console.error(err);
-			ui.error('Error: ' + (err && err.message ? err.message : err));
+			ui.error('Error: ' + friendlyError(err));
 		});
 	}
 
@@ -393,7 +406,8 @@
 			'<div class="pk_row pk_inact" style="border:none">Runs fully in your browser (HT-Demucs AI model).<br>' +
 			'First run downloads ~166 MB model (cached afterwards).<br>' +
 			'One inference pass produces all stems — ticking more stems costs no extra time.<br>' +
-			'A single stem loads into the editor (undo-able); multiple stems are exported as WAV downloads.</div>' +
+			'A single stem loads into the editor (undo-able); multiple stems are exported as WAV downloads.<br>' +
+			'Needs ~2 GB free RAM. If it aborts, close other tabs or select a shorter region.</div>' +
 			'<div class="pk_row" style="border:none">' +
 			'<div class="pk_stemai_track" style="height:6px;background:#222;border-radius:3px;overflow:hidden">' +
 			'<div class="pk_stemai_fill" style="height:100%;width:0%;background:#4a9d5b;transition:width .2s"></div></div>' +
